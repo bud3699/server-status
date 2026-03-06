@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Status Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0d1117; color: #c9d1d9; font-family: ui-monospace, monospace; }
+        .timeline { display: flex; gap: 2px; align-items: center; position: relative; width: max-content; }
+        .tick { height: 35px; width: 10px; border-radius: 1px; transition: transform 0.1s; position: relative; }
+        .tick:hover { transform: scaleY(1.3); z-index: 50; cursor: crosshair; filter: brightness(1.4); }
+        .status-1 { background-color: #238636; } 
+        .status-2 { background-color: #d29922; } 
+        .status-0 { background-color: #da3633; } 
+        #custom-tooltip {
+            position: fixed; display: none; background: #161b22; border: 1px solid #444c56;
+            color: white; padding: 8px 12px; border-radius: 6px; font-size: 11px;
+            pointer-events: none; z-index: 9999; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+        }
+        .scale-footer { display: flex; gap: 2px; margin-top: 12px; pointer-events: none; }
+        .scale-segment { height: 4px; border-radius: 1px; }
+        .live-indicator { width: 8px; height: 8px; border-radius: 50%; background: #60a5fa; display: inline-block; margin-right: 4px; animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
+
+        .timeline-group {
+            width: 840px;
+            transform-origin: left top;
+        }
+        .service-row-container {
+            width: 840px;
+            max-width: 100%;
+        }
+
+        @media (max-width: 768px) {
+            .timeline-group {
+                transform: scale(0.42);
+                margin-bottom: -55px;
+            }
+            .scale-footer .text-label {
+                font-size: 18px !important;
+                font-weight: 900;
+            }
+        }
+    </style>
+</head>
+<body class="p-8 pb-32">
+    <div id="custom-tooltip"></div>
+    <div class="max-w-5xl mx-auto">
+        <div class="flex justify-between items-end mb-8 border-b border-[#30363d] pb-4">
+            <div id="header-meta">
+                <h1 class="text-2xl font-bold text-white tracking-tighter">System Uptime</h1>
+                <p class="text-xs text-slate-500 mt-1">Polling <span id="current-endpoint" class="text-blue-400">Main</span> every <span id="current-interval">60s</span></p>
+            </div>
+            <div id="last-update" class="text-[10px] text-slate-600 uppercase font-bold">Initializing...</div>
+        </div>
+
+        <div id="services-container" class="space-y-6">
+            <div class="text-center py-20 text-slate-500 animate-pulse">Fetching system telemetry...</div>
+        </div>
+    </div>
+
+    <script>
+    const tooltip = document.getElementById('custom-tooltip');
+    const container = document.getElementById('services-container');
+    const updateLabel = document.getElementById('last-update');
+    const endpointLabel = document.getElementById('current-endpoint');
+    const intervalLabel = document.getElementById('current-interval');
+
+    const PRIMARY_URL = 'https://main-status.budtholomew.com';
+    const BACKUP_URL = 'https://backup-status.budtholomew.com'; 
+
+    let isUsingBackup = false;
+    let skipCycles = 0;
+
+    const CHAR_MAP = {
+        'I': 'LAN',
+        'A': 'API',
+        'F': 'Front End',
+        'M': 'Misc',
+        'N': 'NAS',
+        'P': 'NGINX',
+        'S': 'Share',
+        'W': 'WireGuard',
+        'WN': 'Interface',
+        'WT': 'Tunnel'
+    };
+
+    async function fetchData() {
+        if (isUsingBackup && skipCycles > 0) {
+            skipCycles--;
+            updateLabel.innerText = `Backup Mode: Sync in ${skipCycles + 1}m`;
+            return;
+        }
+
+        try {
+            const response = await fetch(PRIMARY_URL);
+            if (!response.ok) throw new Error();
+            
+            const kvData = await response.json();
+            isUsingBackup = false;
+            endpointLabel.innerText = "Main";
+            endpointLabel.className = "text-blue-400";
+            intervalLabel.innerText = "60s";
+            
+            renderDashboard(kvData);
+            updateLabel.innerText = "Last Sync: " + new Date().toLocaleTimeString();
+        } catch (primaryError) {
+            try {
+                const backupResponse = await fetch(BACKUP_URL);
+                if (!backupResponse.ok) throw new Error();
+                
+                const kvData = await backupResponse.json();
+                isUsingBackup = true;
+                skipCycles = 4;
+                
+                endpointLabel.innerText = "BACKUP SERVER";
+                endpointLabel.className = "text-yellow-500 font-bold";
+                intervalLabel.innerText = "5m";
+                
+                renderDashboard(kvData);
+                updateLabel.innerText = "Failover Sync: " + new Date().toLocaleTimeString();
+            } catch (backupError) {
+                updateLabel.innerHTML = `<span class="text-red-500 font-black italic">GLOBAL SYNC FAILURE</span>`;
+            }
+        }
+    }
+
+    function parseTag(name) {
+        const match = name.match(/\(([^)]+)\)/);
+        if (!match) return "Public Front End";
+        
+        const tagContent = match[1].toUpperCase();
+        if (tagContent.includes('W')) return 'WireGuard Infrastructure';
+        if (tagContent.includes('P')) return 'NGINX Infrastructure';
+        if (tagContent.includes('N')) return tagContent.includes('I') ? 'Internal NAS' : 'Public NAS';
+
+        const labels = tagContent.split('').map(c => CHAR_MAP[c] || c);
+        const isInternal = tagContent.includes('I');
+        const filtered = labels.filter(l => l !== 'LAN' && l !== 'Internal');
+        
+        if (filtered.length === 0) {
+            return isInternal ? 'Internal Front End' : 'Public Front End';
+        }
+
+        const baseName = filtered.join(' ');
+        return isInternal ? `Internal ${baseName}` : `Public ${baseName}`;
+    }
+
+    function renderDashboard(kvData) {
+        const dataMap = {};
+        const groups = {};
+
+        Object.values(kvData).forEach(stream => {
+            stream.split(';').filter(x => x.includes('|')).forEach(entry => {
+                const [ts, name, status, lat] = entry.split('|');
+                if (!dataMap[name]) {
+                    dataMap[name] = {};
+                    const category = parseTag(name);
+                    if (!groups[category]) groups[category] = [];
+                    groups[category].push(name);
+                }
+                dataMap[name][parseInt(ts)] = { s: parseInt(status), l: lat };
+            });
+        });
+
+        container.innerHTML = '';
+        
+        const sortedCategories = Object.keys(groups).sort((a, b) => {
+            const getPriority = (cat) => {
+                const c = cat.toLowerCase();
+                if (c === 'public front end') return 1;
+                if (c === 'public api') return 2;
+                if (c.includes('nas')) return 3;
+                if (c.includes('wireguard')) return 4;
+                if (c.includes('nginx')) return 5;
+                if (c === 'internal front end') return 6;
+                if (c === 'internal api') return 7;
+                if (c === 'internal misc') return 8;
+                return 9; 
+            };
+            const priA = getPriority(a);
+            const priB = getPriority(b);
+            if (priA !== priB) return priA - priB;
+            return a.localeCompare(b);
+        });
+
+        sortedCategories.forEach(category => {
+            const sortedServices = groups[category].sort((a, b) => {
+                const aTag = (a.match(/\(([^)]+)\)/) || ["", ""])[1].toUpperCase();
+                const bTag = (b.match(/\(([^)]+)\)/) || ["", ""])[1].toUpperCase();
+                if (aTag.includes('WT') && !bTag.includes('WT')) return 1;
+                if (!aTag.includes('WT') && bTag.includes('WT')) return -1;
+                return a.localeCompare(b);
+            });
+            renderSection(category, sortedServices, dataMap);
+        });
+
+        setupTooltipListeners();
+    }
+
+    function renderSection(title, serviceList, dataMap) {
+        const now = Math.floor(Date.now() / 60000) * 60;
+        const sectionHeader = `
+            <div class="pt-8 border-t border-[#30363d] first:border-t-0 first:pt-0">
+                <h3 class="text-[10px] font-black text-blue-400 uppercase tracking-[0.4em] opacity-70 mb-6">${title}</h3>
+            </div>`;
+        container.insertAdjacentHTML('beforeend', sectionHeader);
+
+        serviceList.forEach(service => {
+            let ticksHtml = '';
+            let totalTicks = 0;
+            let operationalTicks = 0;
+            let lastStatus = 0;
+
+            const zones = [
+                { count: 46, interval: 30 * 60, offset: 60 * 60, zoom: '30m scale' },
+                { count: 9, interval: 5 * 60, offset: 15 * 60, zoom: '5m scale' },
+                { count: 15, interval: 60, offset: 0, zoom: '1m scale' }
+            ];
+
+            zones.forEach((zone, zIdx) => {
+                const limit = (zIdx === 2) ? 0 : 1;
+                for (let i = zone.count; i >= limit; i--) {
+                    const ts = now - zone.offset - (i * zone.interval);
+                    const result = createTick(dataMap[service] || {}, ts, zone.interval, zone.zoom);
+                    ticksHtml += result.html;
+                    totalTicks++;
+                    if (result.status === 1 || result.status === 2) operationalTicks++;
+                    if (zIdx === 2 && i === 0) lastStatus = result.status;
+                }
+            });
+
+            const uptimePct = ((operationalTicks / totalTicks) * 100).toFixed(2);
+            const statusConfig = {
+                1: { text: 'Operational', color: 'text-green-500', bg: 'bg-green-500' },
+                2: { text: 'Degraded', color: 'text-yellow-500', bg: 'bg-yellow-500' },
+                0: { text: 'Down', color: 'text-red-500', bg: 'bg-red-500' }
+            };
+            const current = statusConfig[lastStatus] || statusConfig[0];
+            
+            const match = service.match(/\(([^)]+)\)/);
+            const rawName = service.replace(/\s*\([^)]*\)\s*/g, '').trim();
+            let finalName = rawName.toUpperCase();
+            
+            if (match) {
+                const tagContent = match[1].toUpperCase();
+                let suffixes = [];
+                if (!tagContent.includes('N')) {
+                    if (tagContent.includes('I')) suffixes.push('LAN');
+                    if (tagContent.includes('WN')) suffixes.push('INTERFACE');
+                    else if (tagContent.includes('WT')) suffixes.push('TUNNEL');
+                    else if (tagContent.includes('W')) suffixes.push('WIREGUARD');
+                    if (tagContent.includes('A')) suffixes.push('API');
+                    if (suffixes.length > 0) finalName = `${finalName} - ${suffixes.join(' ')}`;
+                }
+            }
+
+            const serviceHtml = `
+            <div class="service-row pb-4">
+                <div class="service-row-container">
+                    <div class="flex justify-between items-end mb-3">
+                        <div class="flex flex-col">
+                            <span class="text-white font-bold text-lg tracking-tight leading-none">${finalName}</span>
+                            <span class="text-[10px] text-slate-500 font-mono tracking-widest mt-1">${uptimePct}% UPTIME</span>
+                        </div>
+                        <div class="flex items-center gap-2 bg-[#0d1117] border border-[#30363d] px-3 py-1 rounded-full">
+                            <span class="w-2 h-2 rounded-full ${current.bg} animate-pulse"></span>
+                            <span class="text-[10px] ${current.color} font-bold uppercase tracking-tighter">${current.text}</span>
+                        </div>
+                    </div>
+                    <div class="timeline-group">
+                        <div class="timeline">${ticksHtml}</div>
+                        <div class="scale-footer">
+                            <div style="width: ${46 * 12}px" class="scale-segment bg-slate-800">
+                                <div class="text-label text-[9px] text-slate-500 mt-2 uppercase">24h History</div>
+                            </div>
+                            <div style="width: ${9 * 12}px" class="scale-segment bg-slate-700 text-center">
+                                <div class="text-label text-[9px] text-slate-500 mt-2 uppercase">5m Scale</div>
+                            </div>
+                            <div style="width: ${15 * 12}px" class="scale-segment bg-blue-900/40 text-right">
+                                <div class="text-label text-[9px] text-blue-400 mt-2 font-bold tracking-tighter italic">
+                                    <span class="live-indicator"></span>LIVE
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+            container.insertAdjacentHTML('beforeend', serviceHtml);
+        });
+    }
+
+    function createTick(serviceData, baseTs, range, zoom) {
+        let statusVal = 0;
+        let count = 0;
+        let latencies = [];
+        for (let t = baseTs; t < baseTs + range; t++) {
+            if (serviceData[t]) {
+                statusVal = serviceData[t].s;
+                count++;
+                if (serviceData[t].l) latencies.push(parseInt(serviceData[t].l));
+            }
+        }
+        let finalStatus = count > 0 ? statusVal : 0;
+        const avgLat = latencies.length ? Math.round(latencies.reduce((a, b) => a + b) / latencies.length) : '0';
+        const dateObj = new Date(baseTs * 1000);
+        const timeStr = dateObj.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        const info = `<strong>${timeStr}</strong><br>Status: ${count > 0 ? (finalStatus === 1 ? 'Operational' : (finalStatus === 2 ? 'Degraded' : 'Down')) : 'Offline'}<br>Latency: ${avgLat}ms<br><span style="color: #6e7681">${zoom}</span>`;
+        return {
+            status: finalStatus,
+            html: `<div class="tick status-${finalStatus}" data-info="${encodeURIComponent(info)}"></div>`
+        };
+    }
+
+    function setupTooltipListeners() {
+        document.querySelectorAll('.tick').forEach(tick => {
+            tick.onmouseenter = (e) => {
+                tooltip.innerHTML = decodeURIComponent(e.target.getAttribute('data-info'));
+                tooltip.style.display = 'block';
+            };
+            tick.onmousemove = (e) => {
+                tooltip.style.left = (e.clientX + 15) + 'px';
+                tooltip.style.top = (e.clientY - 20) + 'px';
+            };
+            tick.onmouseleave = () => tooltip.style.display = 'none';
+        });
+    }
+
+    fetchData();
+    setInterval(fetchData, 60000);
+</script>
+</body>
+</html>
